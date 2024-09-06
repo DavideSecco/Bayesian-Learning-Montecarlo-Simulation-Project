@@ -1,0 +1,2066 @@
+# 7. FORSET FIRES
+
+This dataset reports the number of forest fires in Brazil divided by state. The series comprises the period of approximately 10 years (1998 to 2017).
+
+Task: Fit a regression model with the number of fires as the response variable. You can start by considering data from only one state. The two basic covariates are the year and the month. You can try using an integer-valued distribution, or, if that fails, a normal model (scaling the data with some transformation if necessary).
+
+If you want to use integer-valued observations, round the data to obtain integer numbers for the number of fires (since some data are not integers).
+
+You can also try a more complex model including data from more states.
+# Setup
+## Load Libraries
+
+```{r}
+rm(list=ls())
+set.seed(123)
+##### load libraries #################################################
+if (!require("readr")) install.packages("readr")
+if (!require("")) install.packages(caret)
+if (!require("rjags")) install.packages("rjags")
+if (!require("data.table")) install.packages("data.table")
+if (!require("mltools")) install.packages("mltools")
+if (!require("dplyr")) install.packages("dplyr")
+if (!require("CARBayes")) install.packages("CARBayes")
+if (!require("sf")) install.packages("sf")
+if (!require("mapview")) install.packages("mapview")
+if (!require("spdep")) install.packages("spdep")
+if (!require("geobr")) install.packages("geobr")
+if (!require("BAS")) install.packages("BAS")
+if (!require("ggplot2")) install.packages("ggplot2")
+if (!require("jagsUI")) install.packages("jagsUI")
+if (!require("loo")) install.packages("loo")
+if (!require("bayesplot")) install.packages("bayesplot")
+if (!require("zoo")) install.packages("zoo")
+
+```
+
+## Data loading
+
+```{r}
+amazon <- read_csv("Brazil_fire_cleaned.csv", locale = locale(encoding = "WINDOWS-1252"))
+amazon$number=as.integer(gsub("\\.","",amazon$number))
+# add additional dataset with columns about el nino la nina
+# dataset with out rolling 3 month average was choosen, bc otherwise
+# joining of both dataset becomes more complicated
+nino <- read_csv("Nino.csv",locale = locale(encoding = "WINDOWS-1252"))
+```
+
+## Data Preprocessing
+
+changed wrongly encoded charachters in the State names
+
+```{r}
+amazon = amazon %>% mutate(state = case_when(
+  state == "AmapÃ¡" ~ "Amapa",
+  state == "Rio de Janeiro" ~ "Rio De Janeiro",
+  state == "CearÃ¡" ~ "Ceara",
+  state == "EspÃ­rito Santo" ~ "Espirito Santo",
+  state == "GoiÃ¡s" ~ "Goias",
+  state == "MaranhÃ£o" ~ "Maranhao",
+  state == "ParanÃ¡" ~ "Parana",
+  state == "ParaÃ­ba" ~ "Paraiba",
+  state == "ParÃ¡" ~ "Pará",
+  state == "PiauÃ­" ~ "Piau",
+  state == "RondÃ´nia" ~ "Rondonia",
+  state == "SÃ£o Paulo" ~ "Sao Paulo",
+  TRUE ~ state,
+))
+
+# remove "weird" characters from Month name
+amazon$month=ifelse(amazon$month=="MarÃ§o","Marzo",amazon$month)
+
+# Define the mapping of months to seasons 
+seasons <- c("Janeiro" = "4",   # Inverno
+             "Fevereiro" = "4", # Inverno
+             "Marzo" = "1",     # Primavera
+             "Abril" = "1",     # Primavera
+             "Maio" = "1",      # Primavera
+             "Junho" = "2",     # Verão
+             "Julho" = "2",     # Verão
+             "Agosto" = "2",    # Verão
+             "Setembro" = "3",  # Outono
+             "Outubro" = "3",   # Outono
+             "Novembro" = "3",  # Outono
+             "Dezembro" = "4")  # Inverno
+
+# Define the mapping of months to seasons
+# seasons <- c("Janeiro" = "4",   # Inverno
+#              "Fevereiro" = "4", # Inverno
+#              "Marzo" = "4",     # Primavera
+#              "Abril" = "4",     # Primavera
+#              "Maio" = "1",      # Primavera
+#              "Junho" = "1",     # Verão
+#              "Julho" = "2",     # Verão
+#              "Agosto" = "2",    # Verão
+#              "Setembro" = "3",  # Outono
+#              "Outubro" = "2",   # Outono
+#              "Novembro" = "1",  # Outono
+#              "Dezembro" = "4")  # Inverno
+
+
+# Define the mapping of months to numbers,
+# so that the amazon dataset can be joined with the nino dataset
+monthNum <- c("Janeiro" = "1",   # Inverno
+             "Fevereiro" = "2", # Inverno
+             "Marzo" = "3",     # Primavera
+             "Abril" = "4",     # Primavera
+             "Maio" = "5",      # Primavera
+             "Junho" = "6",     # Verão
+             "Julho" = "7",     # Verão
+             "Agosto" = "8",    # Verão
+             "Setembro" = "9",  # Outono
+             "Outubro" = "10",   # Outono
+             "Novembro" = "11",  # Outono
+             "Dezembro" = "12")  # Inverno
+
+# Create a new column 'season' in the dataset
+amazon$season <- seasons[amazon$month]
+# Create a new column 'MonthNum' in the dataset
+amazon$MonthNum <- monthNum[amazon$month]
+# make sure the response variable are only integers
+amazon$number=as.integer(amazon$number)
+# create a year trend variable from 1 to ..
+amazon$yr_trend=amazon$year-(min(amazon$year)-1)
+# join the amazon dataset with nino dataset based on the Month and the year
+amazon=merge(amazon,nino,by.x=c("MonthNum","year"),by.y=c("MON","YR"),all.x=TRUE)
+
+# scaling of numeric variables
+amazon$sc_ANOM=scale(amazon$ANOM)
+amazon$sc_yr_trend=scale(amazon$yr_trend)
+amazon$sc_ClimAdjust=scale(amazon$ClimAdjust)
+
+# create dummy Variables for seasons
+
+amazon$season=as.factor(amazon$season)
+amazon <- as.data.frame(one_hot(as.data.table(amazon)))
+
+#dmy <- dummyVars(" ~ season", data = amazon)
+#col_dmy=predict(dmy,amazon)
+#amazon=cbind(amazon,col_dmy)
+# Variables to add to the Bayesian model
+relevantVars=c("intercept","sc_yr_trend","sc_ANOM","sc_ClimAdjust","season_2","season_3","season_4")
+
+rsq <- function (x, y) cor(x, y) ^ 2
+
+```
+
+### Exploratory data visulaisations
+
+choose data of only one state -\> later maybe with random effects for every state State Tocantins was for now chosen without any particular reason
+
+```{r}
+STATE="Tocantins"
+data=amazon[amazon$state==STATE,]
+data$MonthNum=as.integer(data$MonthNum)
+data=data[order(data$year,data$MonthNum),]
+
+```
+
+these are the plots from the prof
+
+```{r}
+boxplot(data$number~data$MonthNum,xlab="month",ylab="fires",main="AMAZON FIRES")
+boxplot(data$number~data$year,xlab="year",ylab="fires",main="AMAZON FIRES")
+hist(data$number,prob=F,xlim=c(0,200),breaks=seq(0,26000,2), main="AMAZON FIRES Histogram")
+
+# TODO: It wuold be interestin making a graph where we count the number of fires for each season
+
+# boxplot(data$number~data$season_1,xlab="season",ylab="fires",main="AMAZON FIRES") #DOESN'T WORK, MUST BE FIXED
+spring_fires <- sum(data$number[data$season_1 == 1])
+summer_fires <- sum(data$number[data$season_2 == 1])
+autumn_fires <- sum(data$number[data$season_3 == 1])
+winter_fires <- sum(data$number[data$season_4 == 1])
+
+# Visualizzare il risultato
+print(spring_fires)
+print(summer_fires)
+print(autumn_fires)
+print(winter_fires)
+
+# Correlation matrix:
+par(mfrow=c(1, 1),pty="s")
+image(1:ncol(data[,7:17]),1:ncol(data[,7:17]),cor(data[,7:17]),
+      xlab="",ylab="",main="Correlation between predictors",
+      axes=FALSE)
+axis(1,1:ncol(data[,7:17]),colnames(data[,7:17]),las=2,cex.axis=0.9)
+axis(2,1:ncol(data[,7:17]),colnames(data[,7:17]),las=2,cex.axis=0.9)
+```
+
+
+```{r}
+
+print(amazon %>%
+        arrange((MonthNum))%>%
+        ggplot(aes(factor(as.integer(MonthNum)),number)) +
+        geom_boxplot() +
+        ylab("Number of Forest Fires")+
+        xlab("Month Number"))
+
+
+amazon %>%
+  ggplot(aes(ClimAdjust,number))+
+  geom_point(color="blue",alpha = 0.8)
+```
+
+```{r}
+
+ggplot()+
+  stat_ecdf(data=data,aes(x=number),color="blue",alpha = 0.8)+
+  
+  stat_ecdf(data=amazon[amazon$state=="Mato Grosso",],aes(x=number),color="blue",alpha = 0.8)+
+  stat_ecdf(data=amazon[amazon$state=="Pará",],aes(x=number),color="blue",alpha = 0.8)+
+  
+  stat_ecdf(data=amazon[amazon$state=="Sao Paulo",],aes(x=number),color="blue",alpha = 0.8)+
+  stat_ecdf(data=amazon[amazon$state=="Sergipe",],aes(x=number),color="blue",alpha = 0.8)+
+  
+  stat_ecdf(data=amazon[amazon$state=="Tocantins",],aes(x=number),color="blue",alpha = 0.8)
+  
+```
+
+```{r}
+
+hist(amazon$number,prob=T,xlim=c(0,200),breaks=seq(0,26000,2))
+
+```
+
+```{r}
+fires_per_Month=data%>%group_by(MonthNum)%>%summarise(number=mean(number))
+plot(fires_per_Month$MonthNum,fires_per_Month$number)
+```
+
+# Poisson non bayesian - Frequentistic
+
+```{r}
+model_Frequentist=glm(number ~ sc_yr_trend+sc_ANOM+sc_ClimAdjust+season_2+season_3+season_4, data = data, family =  poisson(link = "log"))
+summary(model_Frequentist)
+
+plot(data$number,col="red")
+points(fitted(model_Frequentist),col="blue")
+
+
+mse_frequentistic = mean((fitted(model_Frequentist)-data$number)^2)
+rsq_frequentistic = rsq(fitted(model_Frequentist),data$number)
+
+paste("mse_Frequentistic: ", mse_frequentistic)
+paste("rsq_Frequentistic: ", rsq_frequentistic)
+
+
+library(lubridate)
+date=data %>% 
+  select(year, MonthNum) %>% 
+  mutate(date = make_date(year, MonthNum))
+
+
+ggplot()+
+  geom_point(aes(y=data$number,x=date$date,col="true"))+
+  geom_line(aes(y=data$number,x=date$date,col="true"))+
+  geom_line(aes(y=fitted(model_Frequentist),x=date$date,col="fitted"),alpha = 0.8)+
+  geom_point(aes(y=fitted(model_Frequentist),x=date$date,col="fitted"),alpha = 0.8)+
+  ylab("Number of Forest Fires")+
+  xlab("")+
+  scale_x_date(date_breaks = "2 year",date_labels="%Y")+
+  theme(legend.title = element_blank())
+
+```
+
+
+```{r}
+install.packages("glmtoolbox")
+glmtoolbox::stepCriterion(model_Frequentist,criterion="bic")
+```
+
+
+
+# Bayesian Model With Jags
+
+```{r}
+# add intercept to the response matrix
+data$intercept=rep(1,nrow(data))
+
+# Variables to add to the Bayesian model
+relevantVars=c("intercept","sc_yr_trend","sc_ANOM","sc_ClimAdjust","season_2","season_3","season_4")
+
+# Define the variables for jags:
+Y = data$number
+X = data[,relevantVars]
+n = length(Y)
+p = ncol(X)
+
+# Define the data list:
+dataList = list(Y=Y,X=X,n=n,p=p)
+
+# Write the model specification:
+model_jags_poisson.string = textConnection("model{
+   
+   # Likelihood
+   for(i in 1:n){
+   
+      Y[i] ~ dpois(lambda[i])
+      log(lambda[i]) <- mu[i]
+      mu[i] <- inprod(beta[],X[i,])
+      # prediction in sample
+      Yp[i] ~ dpois(lambda[i])
+    }
+    
+    # Priors
+    for(j in 1:p){
+      beta[j] ~ dnorm(0,inv.var[j])
+    }
+    
+    for(j in 1:p){
+      inv.var[j] ~ dunif(0.1,20)
+      sigma[j] = 1/inv.var[j]
+    }
+    
+    #inv.var ~ dgamma(1, 1)
+    #sigma = 1/inv.var
+    
+ }")
+
+# Set the options:
+burn = 5000
+n.iter = 40000
+n.adapt = 1000
+# increased thinning bc of increased autocorrelation in season_3 and season_4
+thin = 20 # you delete ten iterations for everyone you keep
+#to improve autocorrelation you can increase thinning
+## add more chains later
+n.chains = 3
+
+# Create a `jags` object:
+# model_standard_poisson = jags.model(model_standard_poisson.string,data=dataList,n.chains=n.chains,n.adapt=n.adapt)
+
+model_jags_poisson <- jags(model.file=model_jags_poisson.string,
+                     data=dataList,
+                     parameters.to.save= c('beta', 'sigma','Yp'), 
+                     n.adapt=n.adapt, n.iter=n.iter,n.chains = 3,n.burnin = burn)
+```
+
+```{r}
+# plot results
+par(mfrow=c(2,2))
+# plot(samples_model_standard_poisson$samples[,c('beta')])
+plot(model_jags_poisson$samples[,c('beta[2]','beta[1]')])
+plot(model_jags_poisson$samples[,c('beta[3]','beta[4]')])
+plot(model_jags_poisson$samples[,c('beta[5]','beta[6]')])
+plot(model_jags_poisson$samples[,c('beta[7]')])
+plot(model_jags_poisson$samples[,c('sigma[1]','sigma[2]')])
+plot(model_jags_poisson$samples[,c('sigma[3]','sigma[4]')])
+plot(model_jags_poisson$samples[,c('sigma[5]','sigma[6]')])
+plot(model_jags_poisson$samples[,c('sigma[7]')])
+#plot(samples_1[,c('inv.var[1]','inv.var[2]')])
+#plot(samples_1[,c('inv.var[3]','inv.var[4]')])
+```
+
+```{r}
+# only works if more chains
+# check whether chains similar values for beta
+plot(summary(model_jags_poisson$samples[[1]])[[1]][,1][1:7],col="red",type="o")
+points(summary(model_jags_poisson$samples[[2]])[[1]][,1][1:7],col="blue",type="o")
+points(summary(model_jags_poisson$samples[[3]])[[1]][,1][1:7],type="p")
+#summary(samples_1[[2]])[[3]][,1]
+
+```
+
+```{r}
+# Let's plot the autocorrelation graph to understand if we're performing enough iterations:
+autocorr.plot(model_jags_poisson$samples[,c('beta[1]','beta[2]')])
+autocorr.plot(model_jags_poisson$samples[,c('beta[3]','beta[4]')])
+autocorr.plot(model_jags_poisson$samples[,c('beta[5]','beta[6]')])
+autocorr.plot(model_jags_poisson$samples[,c('beta[7]')])
+#effectiveSize(samples_1)
+
+```
+
+```{r}
+
+
+#distribution prediction - prof approach
+t=seq(1:length(Y))
+plot(t,data$number,col='red',main="standard Bayesian synthetic data")
+Yp=model_jags_poisson$mean$Yp
+points(t,Yp,pch="*",col="blue")
+lines(t,data$number,col='red')
+lines(t,Yp,col='blue')
+
+mse_poisson=mean((Yp-data$number)^2)
+mse_poisson
+
+
+rsq_poisson = rsq(Yp,data$number)
+rsq_poisson
+
+# Tutor approach
+mod = as.matrix(do.call(rbind, model_jags_poisson$samples))
+betas=mod[,grepl("beta",colnames(mod))]
+# get fitted values
+pmean_coef = apply(betas, 2, mean)
+fitted_mean =exp(as.matrix(X) %*% as.vector(pmean_coef))
+
+
+
+
+
+#mse_median_standard_poisson = mean((fitted_median-data$number)^2)
+mse_mean_poisson_2 = mean((fitted_mean-data$number)^2)
+#rsq_standard_poisson = rsq(fitted_mean,data$number)
+
+
+
+library(lubridate)
+date=data %>% 
+  dplyr::select(year, MonthNum) %>% 
+  mutate(date = make_date(year, MonthNum))
+
+ggplot()+
+  geom_point(aes(y=data$number,x=date$date,col="true"))+
+  geom_point(aes(y=fitted_mean,x=date$date,col="fitted"),alpha = 0.8)+
+  ylab("Number of Forest Fires")+
+  xlab("")+
+  scale_x_date(date_breaks = "2 year",date_labels="%Y")+
+  theme(legend.title = element_blank())
+```
+
+
+```{r}
+# shows that coefs of frequentist and bayesian are the same
+# Is interesting but probably should be put at the end
+print(c("intercept","sc_yr_trend","sc_ANOM","sc_ClimAdjust","season_2","season_3","season_4"))
+pmean_coef
+coef(model_Frequentist)
+``` 
+
+
+# AR 1 and 12 normal model 
+
+```{r}
+
+# add intercept to the response matrix
+data$intercept=rep(1,nrow(data))
+
+# Variables to add to the Bayesian model
+relevantVars=c("intercept","sc_yr_trend","sc_ANOM","sc_ClimAdjust","season_2","season_3","season_4")
+
+model_AR_1_12_normal.string <- "model{
+   
+   # Likelihood
+   mu[1]<-Y[1]
+   mu[2]<-Y[2]
+   mu[3]<-Y[3]
+   mu[4]<-Y[4]
+   mu[5]<-Y[5]
+   mu[6]<-Y[6]
+   mu[7]<-Y[7]
+   mu[8]<-Y[8]
+   mu[9]<-Y[9]
+   mu[10]<-Y[10]
+   mu[11]<-Y[11]
+   mu[12]<-Y[12]
+   for(i in 13:n){
+      Y[i] ~ dnorm(mu[i], tau)
+      mu[i] <- m0 + alpha1*Y[i-1]+alpha12*Y[i-12]
+      Yp[i] ~ dnorm(mu[i], tau) # prediction in sample
+    }
+    
+    #
+    alpha1~dunif(-1,1)
+    alpha12~dunif(-1,1)
+    tau ~ dgamma(0.1, 10)
+    m0 ~dnorm(0.0, 1.0E-4)
+    #inv.var ~ dgamma(1, 1)
+    #sigma = 1/inv.var
+    
+ }"
+
+# Define the variables fro jaga:
+Y = data$number
+X = data[,relevantVars]
+n = length(Y)
+p = ncol(X)
+
+# Define the data list:
+dataList = list(Y=Y,X=X,n=n,p=p)
+
+model_AR_1_12_normal <- jags(model.file=textConnection(model_AR_1_12_normal.string),
+                     data=dataList,
+                     parameters.to.save= c('alpha1','alpha12',"m0","Yp"), 
+                     n.adapt=1000, n.iter=10000,n.chains = 1,n.burnin = 2000)
+```
+
+
+```{r}
+# We should show here some fitted evaluation
+# Wuold be great put as axis the year, in order to clearly see that is "periodic"
+t=seq(1:length(Y))
+plot(t,data$number,col='red',main="AR 1 and 12 normal syntetic data")
+Yp=model_AR_1_12_normal$mean$Yp
+points(t,Yp,pch="*",col="blue")
+lines(t,Yp,col='blue')
+lines(t,data$number,col='red')
+
+# I don't get why the yp are value around 1 (in the graph they assume value like 2000...)
+#summary(model_AR_1_12_normal)
+
+# plot results
+# par(mfrow=c(2,3))
+plot(model_AR_1_12_normal$samples[,c("m0")],main="posterior m0")
+plot(model_AR_1_12_normal$samples[,c("alpha1")],main="posterior alpha1")
+plot(model_AR_1_12_normal$samples[,c("alpha12")],main="posterior alpha12")
+
+y_ts=cbind(dplyr::lag(data$number,n=1),dplyr::lag(data$number,n=12))[13:length(data$number),]
+
+# mod = as.matrix(do.call(rbind, model_AR_1_12_normal$samples))
+# betas=mod[,grepl("alpha",colnames(mod))]
+# # get fitted values
+# pmean_coef = apply(betas, 2, mean)
+# fitted_mean =as.matrix(y_ts) %*% as.vector(pmean_coef)
+# plot(data$number[13:length(data$number)],col="blue",ylim=c(-100,10000))
+# points(fitted_mean,col="red",type="o")
+
+mse_AR_1_12_normal =mean((Yp[13:length(data$number)]-data$number[13:length(data$number)])^2)
+mse_AR_1_12_normal
+rsq_AR_1_12_normal = rsq(Yp[13:length(data$number)],data$number[13:length(data$number)])
+rsq_AR_1_12_normal
+model_AR_1_12_normal$DIC
+```
+
+# AR 1 and 12 model poisson
+
+```{r}
+
+# Define the variables fro jags:
+Y = data$number
+n = length(Y)
+
+# Define the data list:
+dataList = list(Y=Y,n=n)
+
+
+model_AR_1_12_possion_str <- textConnection("model{
+   
+   # Likelihood
+   mu[1]<-Y[1]
+   mu[2]<-Y[2]
+   mu[3]<-Y[3]
+   mu[4]<-Y[4]
+   mu[5]<-Y[5]
+   mu[6]<-Y[6]
+   mu[7]<-Y[7]
+   mu[8]<-Y[8]
+   mu[9]<-Y[9]
+   mu[10]<-Y[10]
+   mu[11]<-Y[11]
+   mu[12]<-Y[12]
+   for(i in 13:n){
+      Y[i] ~ dpois(lambda[i])
+      log(lambda[i])<-mu[i]
+      mu[i] ~ dnorm(norm_mean[i],0.5)
+      norm_mean[i] <- m0 + alpha1*Y[i-1] + alpha12*Y[i-12]
+      
+      
+      Yp[i] ~ dpois(lambdap[i]) # prediction in sample
+      log(lambdap[i])<-norm_mean[i]
+      #mup[i] ~ dnorm(norm_mean[i],0.5)
+      
+      LogLik[i] <- log(dpois( Y[i],lambda[i])) # for WAIC
+    }
+    
+    alpha1 ~ dunif(-1,1)
+    alpha12 ~ dunif(-1,1)
+    m0 ~ dnorm(0.0, 1.0E-4)
+ }")
+
+
+n.adapt=1000
+n.iter=5000
+n.chains = 1
+n.burnin = 2000
+thin=10
+
+model_AR_1_12_poisson <- jags(model.file=model_AR_1_12_possion_str,
+                     data=dataList,
+                     parameters.to.save= c('alpha1','alpha12',"m0","Yp","LogLik"), 
+                     n.adapt=1000, n.iter=10000,n.chains = 1,n.burnin = 2000)
+
+Loglik_AR_1_12_poisson=model_AR_1_12_poisson$sims.list$LogLik[,13:length(Y)] # model without change point
+waic_AR_1_12_poisson <-waic(Loglik_AR_1_12_poisson)
+
+```
+
+
+```{r}
+
+model_AR_1_12_poisson$DIC
+```
+
+
+```{r}
+
+y_lag=data.frame(rep(1,length(data$number)))
+
+for (i in c(1,12)){
+ y_lag=cbind(y_lag,dplyr::lag(data$number,n=i))
+}
+y_ts=y_lag
+
+mod=summary(model_AR_1_12_poisson)[,1]
+alphas=mod[grepl("alpha",names(mod))]
+m0=mod[grepl("m0",names(mod))]
+
+pmean_coef=c(m0,alphas)
+fitted_mean =exp(as.matrix(y_ts) %*% as.vector(unlist(pmean_coef)))
+plot(data$number,col="blue")
+points(fitted_mean,col="red",type="o")
+
+# We should show here some fitted evaluation
+# Wuold be great put as axis the year, in order to clearly see that is "periodic"
+
+mse_AR_1_12_poisson_2=mean((fitted_mean[13:length(data$number)]-data$number[13:length(data$number)])^2)
+mse_AR_1_12_poisson_2
+
+
+t=seq(1:length(Y))
+plot(t,data$number,col='red',main="AR 1 and 12 poisson  syntetic data")
+Yp=model_AR_1_12_poisson$mean$Yp
+points(t,Yp,pch="*",col="blue")
+lines(t,data$number,col='red')
+lines(t,Yp,col="blue")
+
+mse_AR_1_12_poisson=mean((Yp[13:length(data$number)]-data$number[13:length(data$number)])^2)
+mse_AR_1_12_poisson
+rsq_AR_1_12_poisson = rsq(Yp[13:length(data$number)],data$number[13:length(data$number)])
+rsq_AR_1_12_poisson
+
+print(paste0("mse_mean_poisson: ", mse_AR_1_12_poisson))
+```
+
+# AR(12) poisson model 
+
+#### mu[i] ~ dnorm( alpha0 + alpha1*Y[i-1] + alpha2*Y[i-2] + alpha3*Y[i-3] + alpha4*Y[i-4] + alpha5*Y[i-5] +  alpha6*Y[i-6] + alpha7*Y[i-7] + alpha8*Y[i-8] + alpha9*Y[i-9] + alpha10*Y[i-10] + alpha11*Y[i-11] + alpha12*Y[i-12],0.05)
+
+```{r}
+model_AR12_poisson.string <- textConnection("model{
+   # Likelihood
+   mu[1]<-Y[1]
+   mu[2]<-Y[2]
+   mu[3]<-Y[3]
+   mu[4]<-Y[4]
+   mu[5]<-Y[5]
+   mu[6]<-Y[6]
+   mu[7]<-Y[7]
+   mu[8]<-Y[8]
+   mu[9]<-Y[9]
+   mu[10]<-Y[10]
+   mu[11]<-Y[11]
+   mu[12]<-Y[12]
+   
+   for(i in 13:n){
+      # POISSON
+      Y[i] ~ dpois(lambda[i])
+      log(lambda[i])<-norm_mu[i]
+      #mu[i] ~ dnorm(norm_mu[i] ,0.05)
+      
+      # prediction in sample
+      Yp[i] ~ dpois(lambdap[i]) 
+      log(lambdap[i])<-norm_mu[i]
+      #mup[i] ~ dnorm(norm_mu[i] ,0.05)
+      
+      LogLik[i] <- log(dpois(Y[i],lambda[i]))
+      
+      norm_mu[i] <- m0 + alpha[1]*Y[i-1] + alpha[2]*Y[i-2] + alpha[3]*Y[i-3] + alpha[4]*Y[i-4] + alpha[5]*Y[i-5] +  alpha[6]*Y[i-6] + alpha[7]*Y[i-7] + alpha[8]*Y[i-8] + alpha[9]*Y[i-9] + alpha[10]*Y[i-10] + alpha[11]*Y[i-11] + alpha[12]*Y[i-12]
+      
+      # NORMAL
+      # LogLik[i]<- log(dnorm(Y[i],norm_mu[i], tau))
+      # Y[i] ~ dnorm(norm_mu[i], tau)
+      # Yp[i] ~ dnorm(norm_mu[i], tau) # prediction in sample
+
+   }
+    
+    # Priors
+    for(j in 1:12){
+      alpha[j] ~ dunif(-2,2)
+    }
+    
+    m0 ~ dnorm(0.0, 0.0001)
+    tau ~ dgamma(0.1, 1.0E-4)
+    
+ }")
+
+# Define the variables fro jaga:
+Y = data$number
+# X = data[,relevantVars]
+n = length(Y)
+# p = ncol(X)
+
+# Define the data list:
+dataList = list(Y=Y,n=n)
+
+n.adapt=1000
+n.iter=20000
+n.chains = 1
+n.burnin = 2000
+
+model_AR12_poisson <- jags(model.file=model_AR12_poisson.string,
+                     data=dataList,
+                     parameters.to.save= c('m0', 'alpha', 'Yp','LogLik'), 
+                     n.adapt=n.adapt, n.iter=n.iter,n.chains = 1,n.burnin = n.burnin)
+
+model_AR12_poisson$DIC
+
+LogLik_AR12_poisson=model_AR12_poisson$sims.list$LogLik[,13:length(Y)]
+waic_AR12_poisson <-waic(LogLik_AR12_poisson)
+
+```
+
+
+
+
+```{r}
+par(mfrow=c(2,2))
+plot(model_AR12_poisson$samples[,c('m0','alpha[1]')])
+plot(model_AR12_poisson$samples[,c('alpha[2]','alpha[3]')])
+plot(model_AR12_poisson$samples[,c('alpha[4]','alpha[5]')])
+plot(model_AR12_poisson$samples[,c('alpha[6]','alpha[7]')])
+plot(model_AR12_poisson$samples[,c('alpha[8]','alpha[9]')])
+plot(model_AR12_poisson$samples[,c('alpha[10]','alpha[11]')])
+plot(model_AR12_poisson$samples[,c('alpha[12]')])
+
+autocorr.plot(model_AR12_poisson$samples[,c('alpha[1]','alpha[2]')])
+autocorr.plot(model_AR12_poisson$samples[,c('alpha[3]','alpha[4]')])
+autocorr.plot(model_AR12_poisson$samples[,c('alpha[5]','alpha[6]')])
+autocorr.plot(model_AR12_poisson$samples[,c('alpha[7]','alpha[8]')])
+autocorr.plot(model_AR12_poisson$samples[,c('alpha[9]','alpha[10]')])
+autocorr.plot(model_AR12_poisson$samples[,c('alpha[11]','alpha[12]')])
+```
+
+```{r}
+t=seq(1:length(Y))
+plot(t,data$number,col='red',main="AR(12) poisson syntetic data")
+Yp=model_AR12_poisson$mean$Yp
+points(t,Yp,pch="*",col="blue")
+lines(t,Yp,col='blue')
+lines(t,data$number,col='red')
+
+#summary(model_AR12_possion)
+
+
+
+
+
+y_lag=data.frame(rep(1,length(data$number)))
+lags=12
+for (i in 1:lags){
+  y_lag=cbind(y_lag,dplyr::lag(data$number,n=i))
+}
+y_ts=y_lag#[(lags+1):length(data$number),]
+
+mod = as.matrix(do.call(rbind, model_AR12_poisson$samples))
+alphas=mod[,grepl("alpha",colnames(mod))]
+# get fitted values
+pmean_coef = apply(alphas, 2, mean)
+# fitted_mean =exp(as.matrix(y_ts) %*% as.vector(c(pmean_coef)))
+
+
+
+plot(data$number,col="blue")
+points(fitted_mean,col="red",type="o")
+
+
+mse_AR12_poisson=mean((Yp[13:length(data$number)]-data$number[13:length(data$number)])^2)
+mse_AR12_poisson
+rsq_AR12_poisson = rsq(Yp[13:length(data$number)],data$number[13:length(data$number)])
+rsq_AR12_poisson
+
+```
+
+
+# AR(1) poisson model 
+
+
+```{r}
+model_AR1_poisson.string <- textConnection("model{
+   # Likelihood
+   mu[1]<-Y[1]
+
+   for(i in 2:n){
+      # POISSON
+      LogLik[i]<- log(dpois(Y[i],lambda[i]))
+   
+      # prediction in sample
+      Yp[i] ~ dpois(lambdap[i]) 
+      log(lambdap[i])<-norm_mu[i]
+      
+      
+      Y[i] ~ dpois(lambda[i])
+      log(lambda[i])<-norm_mu[i]
+      #log(lambda[i])<-mu[i]
+      #mu[i] ~ dnorm(norm_mu[i] ,0.05)
+      norm_mu[i] <- m0 + alpha[1]*Y[i-1]
+      
+      # NORMAL
+      # LogLik[i]<- log(dnorm(Y[i],mu[i], tau))
+      # Y[i] ~ dnorm(mu[i], tau)
+      # mu[i] <- m0 + alpha[1]*Y[i-1]
+      # Yp[i] ~ dnorm(mu[i], tau) # prediction in sample
+      
+   }
+    
+    # Priors
+    for(j in 1){
+      alpha[j] ~ dunif(-1,1)
+    }
+    tau ~ dgamma(0.1, 1.0E-4)
+    m0 ~ dnorm(0.0,  1.0E-4)
+    
+ }")
+
+# Define the variables fro jaga:
+Y = data$number
+n = length(Y)
+
+# Define the data list:
+dataList = list(Y=Y,n=n)
+
+n.adapt=1000
+n.iter=20000
+n.chains = 1
+n.burnin = 2000
+
+model_AR1_poisson <- jags(model.file=model_AR1_poisson.string,
+                     data=dataList,
+                     parameters.to.save= c('m0', 'alpha', 'Yp','LogLik'), 
+                     n.adapt=n.adapt, n.iter=n.iter,n.chains = 1,n.burnin = burn)
+
+t=seq(1:length(Y))
+plot(t,data$number,col='red',main="AR(1) poisson syntetic data")
+Yp=model_AR1_poisson$mean$Yp
+points(t,Yp,pch="*",col="blue")
+lines(t,Yp,col='blue')
+lines(t,data$number,col='red')
+
+mse_AR1_poisson=mean((Yp[13:length(data$number)]-data$number[13:length(data$number)])^2)
+mse_AR1_poisson
+rsq_AR1_poisson = rsq(Yp[13:length(data$number)],data$number[13:length(data$number)])
+rsq_AR1_poisson
+
+
+
+LogLik_AR1_poisson=model_AR1_poisson$sims.list$LogLik[,13:length(Y)]
+waic_AR1_poisson <-waic(LogLik_AR1_poisson)
+
+
+```
+```{r}
+
+diff_model=loo_compare(waic_AR12_poisson,waic_AR_1_12_poisson,waic_AR1_poisson)
+diff_model
+
+
+```
+
+
+
+```{r}
+par(mfrow=c(2,2))
+
+plot(model_AR1_poisson$samples[,c("m0","alpha")])
+
+```
+
+```{r}
+t=seq(1:length(Y))
+plot(t,data$number,col='red',main="AR 1 poisson syntetic data")
+#Yp=model_AR1_poisson$q50$Yp
+Yp=model_AR1_poisson$mean$Yp
+points(t,Yp,pch="*",col="blue")
+lines(t,Yp,col='blue')
+lines(t,data$number,col='red')
+
+
+y_lag=data.frame(rep(1,length(data$number)))
+lags=1
+for (i in 1:lags){
+  y_lag=cbind(y_lag,dplyr::lag(data$number,n=i))
+}
+y_ts=y_lag#[(lags+1):length(data$number),]
+
+mod = as.matrix(do.call(rbind, model_AR1_poisson$samples))
+alphas=mod[,grepl("alpha",colnames(mod))]
+m0=mod[,grepl("m0",colnames(mod))]
+# get fitted values
+pmean_coef = c(mean(m0),mean(alphas))
+fitted_mean =exp(as.matrix(y_ts) %*% as.vector(c(pmean_coef)))
+
+
+
+plot(data$number,col="blue")
+points(fitted_mean,col="red",type="o")
+
+```
+
+
+
+# AR(2) poisson model 
+
+```{r}
+model_AR2_poisson.string <- textConnection("model{
+   # Likelihood
+   mu[1]<-Y[1]
+   mu[2]<-Y[2]
+   
+   for(i in 3:n){
+   
+      LogLik[i]<- log(dpois(Y[i],lambda[i]))
+   
+      # prediction in sample
+      Yp[i] ~ dpois(lambdap[i]) 
+      log(lambdap[i])<-norm_mu[i]
+      
+      #
+      Y[i] ~ dpois(lambda[i])
+      log(lambda[i])<-norm_mu[i]
+      #mu[i] ~ dnorm(norm_mu[i] ,0.05)
+      
+
+      norm_mu[i] <- m0 + alpha[1]*Y[i-1]+ alpha[2]*Y[i-2]
+   }
+    
+    # Priors
+    for(j in 1:2){
+      alpha[j] ~ dunif(-1,1)
+    }
+    
+    m0 ~ dnorm(0.0,  1.0E-4)
+    
+ }")
+
+# Define the variables fro jaga:
+Y = data$number
+n = length(Y)
+
+# Define the data list:
+dataList = list(Y=Y,n=n)
+
+n.adapt=1000
+n.iter=20000
+n.chains = 1
+n.burnin = 2000
+
+model_AR2_poisson <- jags(model.file=model_AR2_poisson.string,
+                     data=dataList,
+                     parameters.to.save= c('m0', 'alpha', 'Yp','LogLik'), 
+                     n.adapt=n.adapt, n.iter=n.iter,n.chains = 1,n.burnin = burn)
+
+
+LogLik_AR2_poisson=model_AR2_poisson$sims.list$LogLik[,13:length(Y)]
+waic_AR2_poisson <-waic(LogLik_AR2_poisson)
+
+
+
+# samples_AR2_poisson=jags.samples(model_AR2_poisson$model,c("WAIC","deviance"),
+#             type = "mean", 
+#             n.iter = n.iter,
+#             n.burnin = n.burnin,
+#             n.thin = 1)
+# samples_AR2_poisson$p_waic <- samples_AR2_poisson$WAIC
+# samples_AR2_poisson$waic <- samples_AR2_poisson$deviance + samples_AR2_poisson$p_waic
+# 
+# tmp <- sapply(samples_AR2_poisson, sum)
+# waic_AR2_poisson <- round(c(waic = tmp[["waic"]], 
+#                      p_waic = tmp[["p_waic"]]),1)
+
+```
+
+
+
+
+```{r}
+par(mfrow=c(2,2))
+
+plot(model_AR2_poisson$samples[,c("m0","alpha[1]")])
+plot(model_AR2_poisson$samples[,c("alpha[2]")])
+
+```
+
+```{r}
+t=seq(1:length(Y))
+plot(t,data$number,col='red',main="AR 2 poisson syntetic data")
+#Yp=model_AR1_poisson$q50$Yp
+Yp=model_AR2_poisson$mean$Yp
+points(t,Yp,pch="*",col="blue")
+lines(t,Yp,col='blue')
+lines(t,data$number,col='red')
+legend("topright", legend = c("fitted", "true"), col = c("blue", "red"), lty = 1)
+
+
+
+y_lag=data.frame(rep(1,length(data$number)))
+lags=2
+for (i in 1:lags){
+  y_lag=cbind(y_lag,dplyr::lag(data$number,n=i))
+}
+y_ts=y_lag#[(lags+1):length(data$number),]
+
+mod = as.matrix(do.call(rbind, model_AR2_poisson$samples))
+alphas=mod[,grepl("alpha",colnames(mod))]
+alphas=apply(alphas,2,mean)
+m0=mod[,grepl("m0",colnames(mod))]
+# get fitted values
+pmean_coef = c(mean(m0),alphas)
+fitted_mean =exp(as.matrix(y_ts) %*% as.vector(c(pmean_coef)))
+
+
+# 
+# plot(data$number,col="blue")
+# points(fitted_mean,col="red",type="o")
+
+
+mse_AR2_poisson=mean((Yp[13:length(data$number)]-data$number[13:length(data$number)])^2)
+mse_AR2_poisson
+# 
+# mse_AR_2_poisson=mean((fitted_mean[2:length(data$number)]-data$number[2:length(data$number)])^2)
+# mse_AR_2_poisson
+
+```
+
+
+
+# comparison only AR
+
+```{r}
+
+
+diff_model=loo_compare(waic_AR12_poisson,waic_AR_1_12_poisson,waic_AR1_poisson,waic_AR2_poisson)
+diff_model
+# 1. lag 1 and 2
+# 2. lag 1 to 12
+# 3. lag 1
+# 4. lag 1 and 12
+
+
+
+```
+
+# AR(2) + betas poisson do only ar 2 as its best from Ar models
+
+```{r}
+
+# Define the variables fro jaga:
+data$intercept=rep(1,nrow(data))
+Y = data$number
+X = data[,relevantVars]
+n = length(Y)
+p = ncol(X)
+
+# Define the data list:
+dataList = list(Y=Y,X=X,n=n,p=p)
+
+
+model_AR2_beta_poisson_str <- textConnection("model{
+   
+   # Likelihood
+   mu[1]<-Y[1]
+   mu[2]<-Y[2]
+   trend[1]<-inprod(beta[],X[1,])
+   trend[2]<-inprod(beta[],X[2,])
+   for(i in 3:n){
+   
+      #prediction
+      Yp[i] ~ dpois(lambdap[i])
+      log(lambdap[i]) <- norm_mean[i]
+   
+      LogLik[i] <- log(dpois( Y[i],lambda[i]))
+      
+      #
+      Y[i] ~ dpois(lambda[i])
+      log(lambda[i])<-norm_mean[i]
+      
+       #mu[i] ~ dnorm(norm_mean[i],0.05)
+       norm_mean[i] <- alpha[1]*(Y[i-1]-trend[i-1])+alpha[2]*(Y[i-2]-trend[i-2])
+       trend[i]<-inprod(beta[],X[i,])
+    }
+    
+    # priors
+    for(j in 1:p){
+      beta[j] ~ dnorm(0,inv.var[j])T(-100,100)
+    }
+    
+    for(j in 1:p){
+      inv.var[j] ~ dunif(0.1, 20)
+      sigma[j] = 1/inv.var[j]
+    }
+    
+    for(j in 1:2){
+      alpha[j] ~ dunif(-1,1)
+    }
+
+    #tau ~ dgamma(0.1, 10)
+    #inv.var ~ dgamma(1, 1)
+    #sigma = 1/inv.var
+    
+ }")
+
+
+n.adapt=1000
+n.iter=10000
+n.chains = 2
+n.burnin = 2000
+thin=20
+
+
+model_AR2_beta_poisson=jags(model.file=model_AR2_beta_poisson_str,data=dataList,parameters.to.save=c("beta","alpha","sigma","Yp","LogLik"),n.iter=n.iter,n.adapt=n.adapt,n.burnin=n.burnin,n.chains=n.chains)
+
+
+LogLik_AR2_beta_poisson=model_AR2_beta_poisson$sims.list$LogLik[,13:length(Y)]
+waic_AR2_beta_poisson <-waic(LogLik_AR2_beta_poisson)
+
+```
+
+
+```{r}
+
+
+par(mfrow=c(2,2))
+plot(model_AR2_beta_poisson$samples[,c('alpha[1]','alpha[2]')])
+# plot(model_AR12_beta_possion$samples[,c('alpha[2]','alpha[3]')])
+# plot(model_AR12_beta_possion$samples[,c('alpha[4]','alpha[5]')])
+# plot(model_AR12_beta_possion$samples[,c('alpha[6]','alpha[7]')])
+# plot(model_AR12_beta_possion$samples[,c('alpha[8]','alpha[9]')])
+# plot(model_AR12_beta_possion$samples[,c('alpha[10]','alpha[11]')])
+# plot(model_AR12_beta_possion$samples[,c('alpha[12]')])
+plot(model_AR2_beta_poisson$samples[,c('beta[1]')])
+plot(model_AR2_beta_poisson$samples[,c('beta[2]','beta[3]')])
+plot(model_AR2_beta_poisson$samples[,c('beta[4]','beta[5]')])
+plot(model_AR2_beta_poisson$samples[,c('beta[6]','beta[7]')])
+
+
+
+
+```
+
+```{r}
+t=seq(1:length(Y))
+plot(t,data$number,col='red',main="AR 2 poisson syntetic data")
+#Yp=model_AR1_poisson$q50$Yp
+Yp=model_AR2_beta_poisson$mean$Yp
+points(t,Yp,pch="*",col="blue")
+lines(t,Yp,col='blue')
+lines(t,data$number,col='red')
+
+rsq_AR2_beta_poisson=rsq(Yp[13:length(data$number)],data$number[13:length(data$number)])
+
+mse_AR2_beta_poisson=mean((Yp[13:length(data$number)]-data$number[13:length(data$number)])^2)
+mse_AR2_beta_poisson
+rsq_AR2_beta_poisson*100
+
+
+```
+# AR 1 and 2 normal model 
+
+```{r}
+
+# add intercept to the response matrix
+#data$intercept=rep(1,nrow(data))
+
+# Variables to add to the Bayesian model
+#relevantVars=c("intercept","sc_yr_trend","sc_ANOM","sc_ClimAdjust","season_2","season_3","season_4")
+
+model_AR_1_2_normal.string <- "model{
+   
+   # Likelihood
+   mu[1]<-Y[1]
+   mu[2]<-Y[2]
+   for(i in 13:n){
+      Y[i] ~ dnorm(mu[i], tau)
+      mu[i] <- m0 + alpha1*Y[i-1]+alpha2*Y[i-2]
+      Yp[i] ~ dnorm(mu[i], tau) # prediction in sample
+    }
+    
+    #
+    alpha1~dunif(-1,1)
+    alpha2~dunif(-1,1)
+    tau ~ dgamma(0.1, 10)
+    m0 ~dnorm(0.0, 1.0E-4)
+    #inv.var ~ dgamma(1, 1)
+    #sigma = 1/inv.var
+    
+ }"
+
+# Define the variables fro jaga:
+Y = data$number
+X = data[,relevantVars]
+n = length(Y)
+p = ncol(X)
+
+# Define the data list:
+dataList = list(Y=Y,X=X,n=n,p=p)
+
+model_AR_1_2_normal <- jags(model.file=textConnection(model_AR_1_2_normal.string),
+                     data=dataList,
+                     parameters.to.save= c('alpha1','alpha2',"m0","Yp"), 
+                     n.adapt=1000, n.iter=10000,n.chains = 1,n.burnin = 2000)
+```
+
+
+```{r}
+# We should show here some fitted evaluation
+# Wuold be great put as axis the year, in order to clearly see that is "periodic"
+t=seq(1:length(Y))
+plot(t,data$number,col='red',main="AR 1 and 12 normal syntetic data")
+Yp=model_AR_1_2_normal$mean$Yp
+points(t,Yp,pch="*",col="blue")
+lines(t,Yp,col='blue')
+lines(t,data$number,col='red')
+
+# I don't get why the yp are value around 1 (in the graph they assume value like 2000...)
+#summary(model_AR_1_12_normal)
+
+# plot results
+# par(mfrow=c(2,3))
+plot(model_AR_1_2_normal$samples[,c("m0")],main="posterior m0")
+plot(model_AR_1_2_normal$samples[,c("alpha1")],main="posterior alpha1")
+plot(model_AR_1_2_normal$samples[,c("alpha2")],main="posterior alpha2")
+
+y_ts=cbind(dplyr::lag(data$number,n=1),dplyr::lag(data$number,n=12))[13:length(data$number),]
+
+# mod = as.matrix(do.call(rbind, model_AR_1_12_normal$samples))
+# betas=mod[,grepl("alpha",colnames(mod))]
+# # get fitted values
+# pmean_coef = apply(betas, 2, mean)
+# fitted_mean =as.matrix(y_ts) %*% as.vector(pmean_coef)
+# plot(data$number[13:length(data$number)],col="blue",ylim=c(-100,10000))
+# points(fitted_mean,col="red",type="o")
+
+mse_AR_1_2_normal =mean((Yp[13:length(data$number)]-data$number[13:length(data$number)])^2)
+mse_AR_1_2_normal
+rsq_AR_1_2_normal = rsq(Yp[13:length(data$number)],data$number[13:length(data$number)])
+rsq_AR_1_2_normal
+
+rsq_AR_1_2_normal=rsq(Yp[13:length(data$number)],data$number[13:length(data$number)])
+
+model_AR_1_2_normal$DIC
+```
+
+
+# plot AR(2) poisson vs AR(2) gaussian
+```{r}
+
+# Rename parameters for plotting
+# plot AR(2) poisson vs AR(2) gaussian
+
+
+# Plot the distribution of alpha1 with a vertical line at the mean
+samples_p <- as.matrix(model_AR2_poisson$samples)
+samples_g <- as.matrix(model_AR_1_2_normal$samples)
+library(bayesplot)
+library(brms)
+
+
+# Rename parameters for plotting
+# colnames(samples_matrix) <- c("Intercept", "sc_yr_trend", "sc_ANOM", "sc_ClimAdjust", "season_2", "season_3", "season_4")
+
+
+library(gridExtra )
+
+
+plt0=mcmc_areas(samples_p, pars = "alpha[1]",prob=0.95) 
+
+plt1=mcmc_areas(samples_g, pars = "alpha1",prob=0.95)
+
+plt2=mcmc_areas(samples_p, pars = "alpha[2]",prob=0.95) 
+
+plt3=mcmc_areas(samples_g, pars = "alpha2",prob=0.95) 
+
+
+grid.arrange(plt0,plt1, plt2, plt3, ncol = 2)
+```
+
+
+
+# AR(12) + betas poisson
+
+```{r}
+
+# Define the variables fro jaga:
+data$intercept=rep(1,nrow(data))
+Y = data$number
+X = data[,relevantVars]
+n = length(Y)
+p = ncol(X)
+
+# Define the data list:
+dataList = list(Y=Y,X=X,n=n,p=p)
+
+
+model_AR12_beta_poisson_str <- textConnection("model{
+   
+   # Likelihood
+   mu[1]<-Y[1]
+   mu[2]<-Y[2]
+   mu[3]<-Y[3]
+   mu[4]<-Y[4]
+   mu[5]<-Y[5]
+   mu[6]<-Y[6]
+   mu[7]<-Y[7]
+   mu[8]<-Y[8]
+   mu[9]<-Y[9]
+   mu[10]<-Y[10]
+   mu[11]<-Y[11]
+   mu[12]<-Y[12]
+   for(i in 13:n){
+      # POISSON:
+      #prediction
+      Yp[i] ~ dpois(lambdap[i])
+      log(lambdap[i]) <- norm_mu[i]
+   
+      LogLik[i] <- log(dpois( Y[i],lambda[i]))
+      
+      
+      Y[i] ~ dpois(lambda[i])
+      log(lambda[i])<-norm_mu[i]
+      
+      
+       #mu[i] ~ dnorm(norm_mu[i],0.05)
+       norm_mu[i] <- alpha[1]*Y[i-1] + alpha[2]*Y[i-2]+ alpha[3]*Y[i-3] + alpha[4]*Y[i-4] + alpha[5]*Y[i-5] + alpha[6]*Y[i-6] + alpha[7]*Y[i-7] + alpha[8]*Y[i-8] + alpha[9]*Y[i-9] + alpha[10]*Y[i-10] + alpha[11]*Y[i-11] + alpha[12]*Y[i-12] + inprod(beta[],X[i,])
+       
+       # Normal:
+       # LogLik[i]<- log(dnorm(Y[i],norm_mu[i], tau))
+       # Y[i] ~ dnorm(norm_mu[i], tau)
+       # Yp[i] ~ dnorm(norm_mu[i], tau) # prediction in sample
+       
+    }
+    
+    # priors
+    for(j in 1:p){
+      beta[j] ~ dnorm(0,inv.var[j])
+    }
+    
+    for(j in 1:p){
+      inv.var[j] ~ dunif(0.1, 20)
+      sigma[j] = 1/inv.var[j]
+    }
+    
+    for(j in 1:12){
+      alpha[j] ~ dunif(-1,1)
+    }
+    m0 ~ dnorm(0.0,  1.0E-4)
+    tau ~ dgamma(0.1, 10)
+    #inv.var ~ dgamma(1, 1)
+    #sigma = 1/inv.var
+    
+ }")
+
+
+n.adapt=1000
+n.iter=15000
+n.chains = 1
+n.burnin = 2000
+thin=10
+
+
+model_AR12_beta_poisson=jags(model.file=model_AR12_beta_poisson_str,data=dataList,parameters.to.save=c("beta","alpha","sigma","Yp","LogLik"),n.iter=n.iter,n.adapt=n.adapt,n.burnin=n.burnin,n.chains=n.chains)
+
+
+Loglik_AR12_beta_poisson=model_AR12_beta_poisson$sims.list$LogLik[,13:length(Y)]
+waic_AR12_beta_poisson <-waic(Loglik_AR12_beta_poisson)
+
+```
+
+
+```{r}
+
+
+par(mfrow=c(2,2))
+plot(model_AR12_beta_poisson$samples[,c('alpha[1]')])
+plot(model_AR12_beta_poisson$samples[,c('alpha[2]','alpha[3]')])
+plot(model_AR12_beta_poisson$samples[,c('alpha[4]','alpha[5]')])
+plot(model_AR12_beta_poisson$samples[,c('alpha[6]','alpha[7]')])
+plot(model_AR12_beta_poisson$samples[,c('alpha[8]','alpha[9]')])
+plot(model_AR12_beta_poisson$samples[,c('alpha[10]','alpha[11]')])
+plot(model_AR12_beta_poisson$samples[,c('alpha[12]')])
+plot(model_AR12_beta_poisson$samples[,c('beta[2]','beta[3]')])
+plot(model_AR12_beta_poisson$samples[,c('beta[4]','beta[5]')])
+plot(model_AR12_beta_poisson$samples[,c('beta[6]','beta[7]')])
+
+```
+
+```{r}
+t=seq(1:length(Y))
+plot(t,data$number,col='red',main="AR 2 poisson syntetic data")
+#Yp=model_AR1_poisson$q50$Yp
+Yp=model_AR12_beta_poisson$mean$Yp
+points(t,Yp,pch="*",col="blue")
+lines(t,Yp,col='blue')
+lines(t,data$number,col='red')
+
+
+mse_AR12_beta_possion=mean((Yp[13:length(data$number)]-data$number[13:length(data$number)])^2)
+mse_AR12_beta_possion
+rsq_AR12_beta_possion = rsq(Yp[13:length(data$number)],data$number[13:length(data$number)])
+rsq_AR12_beta_possion
+
+```
+
+
+
+# AR(12) + betas lasso poisson
+
+```{r}
+
+# Define the variables fro jaga:
+data$intercept=rep(1,nrow(data))
+Y = data$number
+X = data[,relevantVars]
+n = length(Y)
+p = ncol(X)
+
+# Define the data list:
+dataList = list(Y=Y,X=X,n=n,p=p)
+
+
+model_AR12_beta_lasso_poisson_str <- textConnection("model{
+   
+   # Likelihood
+   mu[1]<-Y[1]
+   mu[2]<-Y[2]
+   mu[3]<-Y[3]
+   mu[4]<-Y[4]
+   mu[5]<-Y[5]
+   mu[6]<-Y[6]
+   mu[7]<-Y[7]
+   mu[8]<-Y[8]
+   mu[9]<-Y[9]
+   mu[10]<-Y[10]
+   mu[11]<-Y[11]
+   mu[12]<-Y[12]
+   for(i in 13:n){
+   
+      #prediction
+      Yp[i] ~ dpois(lambdap[i])
+      log(lambdap[i]) <- norm_mean[i]
+   
+      LogLik[i] <- log(dpois( Y[i],lambda[i]))
+      
+      #
+      Y[i] ~ dpois(lambda[i])
+      log(lambda[i])<-mu[i]
+      
+      
+       mu[i] ~ dnorm(norm_mean[i],0.05)
+       norm_mean[i] <- alpha[1]*Y[i-1] + alpha[2]*Y[i-2]+ alpha[3]*Y[i-3] + alpha[4]*Y[i-4] + alpha[5]*Y[i-5] + alpha[6]*Y[i-6] + alpha[7]*Y[i-7] + alpha[8]*Y[i-8] + alpha[9]*Y[i-9] + alpha[10]*Y[i-10] + alpha[11]*Y[i-11] + alpha[12]*Y[i-12] + inprod(beta[],X[i,])
+    }
+    
+    # priors
+    for(j in 1:p){
+      beta[j] ~ ddexp(0,0.5)
+    }
+    
+    for(j in 1:p){
+      inv.var[j] ~ dunif(0.1, 20)
+      sigma[j] = 1/inv.var[j]
+    }
+    
+    for(j in 1:12){
+      alpha[j] ~ ddexp(0,0.5)T(-1,1)
+    }
+
+    #tau ~ dgamma(0.1, 10)
+    #inv.var ~ dgamma(1, 1)
+    #sigma = 1/inv.var
+    
+ }")
+
+
+n.adapt=1000
+n.iter=5000
+n.chains = 1
+n.burnin = 2000
+thin=10
+
+
+model_AR12_beta_lasso_poisson=jags(model.file=model_AR12_beta_lasso_poisson_str,data=dataList,parameters.to.save=c("beta","alpha","sigma","Yp","LogLik", ""),n.iter=n.iter,n.adapt=n.adapt,n.burnin=n.burnin,n.chains=3)
+
+
+
+
+
+samples_AR12_beta_lasso_poisson=jags.samples(model_AR12_beta_lasso_poisson$model,c("WAIC","deviance"),
+            type = "mean", 
+            n.iter = n.iter,
+            n.burnin = n.burnin,
+            n.thin = 1)
+samples_AR12_beta_lasso_poisson$p_waic <- samples_AR12_beta_lasso_poisson$WAIC
+samples_AR12_beta_lasso_poisson$waic <- samples_AR12_beta_lasso_poisson$deviance + samples_AR12_beta_lasso_poisson$p_waic
+
+tmp <- sapply(samples_AR12_beta_lasso_poisson, sum)
+waic_AR12_beta_lasso_poisson <- round(c(waic = tmp[["waic"]], 
+                     p_waic = tmp[["p_waic"]]),1)
+```
+
+
+```{r}
+
+
+par(mfrow=c(2,2))
+plot(model_AR12_beta_lasso_poisson$samples[,c('alpha[1]')])
+plot(model_AR12_beta_lasso_poisson$samples[,c('alpha[2]','alpha[3]')])
+plot(model_AR12_beta_lasso_poisson$samples[,c('alpha[4]','alpha[5]')])
+plot(model_AR12_beta_lasso_poisson$samples[,c('alpha[6]','alpha[7]')])
+plot(model_AR12_beta_lasso_poisson$samples[,c('alpha[8]','alpha[9]')])
+plot(model_AR12_beta_lasso_poisson$samples[,c('alpha[10]','alpha[11]')])
+plot(model_AR12_beta_lasso_poisson$samples[,c('alpha[12]')])
+plot(model_AR12_beta_lasso_poisson$samples[,c('beta[2]','beta[3]')])
+plot(model_AR12_beta_lasso_poisson$samples[,c('beta[4]','beta[5]')])
+plot(model_AR12_beta_lasso_poisson$samples[,c('beta[6]','beta[7]')])
+
+```
+
+
+```{r}
+t=seq(1:length(Y))
+plot(t,data$number,col='red',main="AR 12 poisson syntetic data")
+#Yp=model_AR1_poisson$q50$Yp
+Yp=model_AR12_beta_lasso_poisson$mean$Yp
+points(t,Yp,pch="*",col="blue")
+lines(t,Yp,col='blue')
+lines(t,data$number,col='red')
+
+
+mse_AR12_beta_lasso_poisson=mean((Yp[13:length(data$number)]-data$number[13:length(data$number)])^2)
+mse_AR12_beta_lasso_poisson
+
+```
+
+
+
+
+
+
+
+
+
+# Bayesian linear regression
+
+##### g-prior (Zellner)
+
+In this case, thanks to bernoulli(1), we force to use the complete model
+
+```{r}
+alphapar=200
+
+cog.bas = bas.lm(number ~ sc_yr_trend + sc_ANOM + sc_ClimAdjust + season_1 + season_2 + season_3 , data=data, 
+                    prior = "g-prior", alpha = alphapar, modelprior = Bernoulli(1))
+# summary(amazon.bas)
+beta = coef(cog.bas)
+beta
+plot(beta, ask = F)
+
+```
+
+```{r}
+confint(beta)
+plot(confint(beta),main=paste("g-prior alpha=",alphapar))
+```
+
+##### Zellner-Siow prior
+
+```{r}
+cog.basZS = bas.lm(number ~ sc_yr_trend + sc_ANOM + sc_ClimAdjust + season_1 + season_2 + season_3 + season_4, data =  data, prior="JZS", modelprior = Bernoulli(1))
+#plot(cog.basZS, which=4)
+betaZS = coef(cog.basZS)
+betaZS
+plot(betaZS, ask = F)
+```
+
+```{r}
+# The graphs look very similar, they are actually different
+par(mfrow=c(2,2))
+plot(confint(beta),main=paste("g-prior alpha=",alphapar))
+confint(beta)
+confint(betaZS)
+plot(confint(betaZS),main="ZS-prior ")
+```
+
+We didn't try to make prediction using a test set since the fact that the error we are making is very high
+
+# SPATIAL
+
+```{r}
+
+#Retrieving Brazil's map and creating Neighborhood Matrix
+Brazil_states <- read_state(
+  year = 2019, 
+  showProgress = FALSE
+)
+Brazil_states = Brazil_states %>% mutate(name_state = ifelse(abbrev_state=="PA","Pará",name_state))
+Brazil_states = Brazil_states %>% mutate(name_state = ifelse(abbrev_state=="PB","Paraiba",name_state))
+Brazil_states = Brazil_states %>% mutate(name_state = ifelse(abbrev_state=="PR","Parana",name_state))
+Brazil_states = Brazil_states %>% mutate(name_state = ifelse(abbrev_state=="SP","Sao Paulo",name_state)) %>% arrange(name_state)
+
+nbMatrix = nb2mat(poly2nb(Brazil_states["geom"]), style = "B")
+```
+
+
+```{r}
+# ------------------ Single Spatial Model ------------------------------
+
+amazon_spatial = amazon %>% filter(year == 2013, month == "Novembro") %>% arrange(state)
+
+
+
+CARformula <- number ~  1  # We don't have any other variable to use
+
+#We can only analyze the effect of the value of RHO (NULL, 0 and 1)
+
+CARmodel <- S.CARleroux(formula=CARformula, family="poisson", 
+                      data = amazon_spatial, W=nbMatrix, rho = NULL, verbose = TRUE, 
+                      burnin=5000, n.sample=50000)
+
+
+
+CARmodel0 <- S.CARleroux(formula=CARformula, family="poisson", 
+                        data = amazon_spatial, W=nbMatrix, rho = 0, verbose = TRUE, 
+                        burnin=5000, n.sample=50000)
+
+
+CARmodel1 <- S.CARleroux(formula=CARformula, family="poisson", 
+                         data = amazon_spatial, W=nbMatrix, rho = 1, verbose = TRUE, 
+                         burnin=5000, n.sample=50000)
+
+# result of the fitting
+print(CARmodel$summary.results)
+print(CARmodel0$summary.results)
+print(CARmodel1$summary.results)
+
+
+#Compare models via WAIC
+WA = c(CARmodel1$modelfit["WAIC"],CARmodel0$modelfit["WAIC"],CARmodel$modelfit["WAIC"])
+print(WA)
+
+# Comparison via MSE
+mean((amazon_spatial$number-CARmodel0$fitted.values)^2)
+mean((amazon_spatial$number-CARmodel1$fitted.values)^2)
+mean((amazon_spatial$number-CARmodel$fitted.values)^2)
+
+# Comparison via R2
+rsq(amazon_spatial$number,CARmodel$fitted.values)
+
+rsq(amazon_spatial$number,CARmodel0$fitted.values)
+
+rsq(amazon_spatial$number,CARmodel1$fitted.values)
+
+
+# Plotting random effects confidence intervals
+mcmc_areas(as.matrix(CARmodel0$samples$phi)[,3:8])
+mcmc_areas(as.matrix(CARmodel1$samples$phi)[,3:8])
+
+
+plot(CARmodel0$fitted.values)
+points(amazon_spatial$number,col="red",lwd=3)
+```
+
+
+
+```{r}
+# ------------------ Multivalue Spatial Model ------------------------------
+
+# We use only data from 2005 onward because of time needed
+amazon_spatial_season = amazon %>% 
+  filter(year >= 2005) %>% 
+  arrange(state) %>% 
+  dplyr::select(state,number,season_1,season_2,season_3,season_4,sc_ANOM,sc_ClimAdjust,sc_yr_trend,year,MonthNum)
+
+# Create ind.area for multivalue model
+# ind.area let's the function know what areal unit each observation is related to 
+
+translation = cbind(amazon_spatial_season %>% dplyr::select(state) %>% distinct(),seq(1,27))
+colnames(translation)= c("s","i")
+for(i in seq(0,nrow(amazon_spatial_season))){
+  amazon_spatial_season$ar[i] = translation$i[translation$s==amazon_spatial_season$state[i]]
+}
+ind.area = amazon_spatial_season$ar
+
+# Model with all covariates
+CARmultiformula <- number ~ season_2 + season_4 + season_3 + sc_yr_trend + sc_ClimAdjust + sc_ANOM
+
+CARmultimodel <- S.CARmultilevel(formula=CARmultiformula, family="poisson", ind.area = ind.area,
+                        data = amazon_spatial_season, W=nbMatrix, rho = NULL, verbose = TRUE, 
+                        burnin=5000, n.sample=50000)
+
+# Model with only season values
+CARmultiformula2 <- number ~ season_2 + season_4 + season_3 
+
+CARmultimodel2 <- S.CARmultilevel(formula=CARmultiformula2, family="poisson", ind.area = ind.area,
+                                 data = amazon_spatial_season, W=nbMatrix, rho = NULL, verbose = TRUE, 
+                                 burnin=5000, n.sample=50000)
+
+
+# Model with no Covariates
+CARmultiformula3 <- number ~ 1
+RHO = NULL
+CARmultimodel3 <- S.CARmultilevel(formula=CARmultiformula3, family="poisson", ind.area = ind.area,
+                                  data = amazon_spatial_season, W=nbMatrix, rho = RHO, verbose = TRUE, 
+                                  burnin=5000, n.sample=50000)
+
+# Comparison between the fitted models
+
+print(CARmultimodel$modelfit)
+print(CARmultimodel2$modelfit)
+print(CARmultimodel3$modelfit)
+
+print(CARmultimodel$summary.results)
+print(CARmultimodel2$summary.results)
+print(CARmultimodel3$summary.results)
+
+# Comparison via MSE
+
+mean((amazon_spatial_season$number-CARmultimodel$fitted.values)^2)
+mean((amazon_spatial_season$number-CARmultimodel2$fitted.values)^2)
+mean((amazon_spatial_season$number-CARmultimodel3$fitted.values)^2)
+
+# Comparison via R2 
+
+rsq <- function (x, y) cor(x, y) ^ 2
+rsq(amazon_spatial_season$number,CARmultimodel$fitted.values)
+
+rsq(amazon_spatial_season$number,CARmultimodel2$fitted.values)
+
+rsq(amazon_spatial_season$number,CARmultimodel3$fitted.values)
+
+
+states = amazon_spatial_season %>% dplyr::select(state) %>% distinct()
+
+# plotting confidence intervals for CARMultimodel1 betas
+b = as.matrix(CARmultimodel$samples$beta)
+colnames(b) = c("Intercept","Season 2","Season 3", "Season 4","year trend","Nino:Clim Adjust","Nino:Anom")
+mcmc_areas(b[,2:7])
+
+```
+
+
+Spatial Plots and aggregate Model
+
+```{r}
+# ------------- Plots and aggregated -----------------
+
+# Fitted values + Actual values
+fitted_dataset = cbind(amazon_spatial_season,as.data.frame(fitted(CARmultimodel)))
+fitted_dataset$Date <- as.yearmon(paste(fitted_dataset$year, fitted_dataset$MonthNum), "%Y %m")
+names(fitted_dataset)[names(fitted_dataset) == 'fitted(CARmultimodel)'] <- 'fitted'
+
+# Compute average residuals per month
+
+state_month_residuals = fitted_dataset %>% 
+  dplyr::select(state,year,MonthNum,fitted,number)%>%
+  mutate(residuals= number-fitted) %>%
+  group_by(state,MonthNum)%>%
+  summarise(res = mean(residuals)) %>%
+  arrange(state,as.integer(MonthNum))
+
+# Plot fitted values vs true values per state
+
+for ( i in states$state){
+  print(ggplot(fitted_dataset %>% filter(state == i), aes(as.Date(Date),fitted)) +
+          geom_point(aes(col="fitted"),alpha= 0.8) +
+          geom_point(aes(as.Date(Date),number,col="true"),alpha=0.8)+
+          ylab(paste("Number of Forest Fires in ",i))+
+          xlab("")+
+          scale_x_date(date_breaks = "2 year",date_labels="%Y")+
+          theme(legend.title = element_blank()))
+  readline(prompt="Press [enter] to continue")
+}
+
+# Plot residuals per state
+for ( i in states$state){
+  print(ggplot(fitted_dataset %>% filter(state == i), aes(as.Date(Date),number-fitted)) +
+          geom_point(aes(col="residuals"),alpha= 0.8) +
+          ylab(paste("Residuals in ",i))+
+          xlab("")+
+          scale_x_date(date_breaks = "2 year",date_labels="%Y")+
+          theme(legend.title = element_blank()))
+  readline(prompt="Press [enter] to continue")
+}
+
+#Plot average monthly residuals per state
+
+for ( i in states$state){
+  print(ggplot(state_month_residuals %>% filter(state == i), aes(as.integer(MonthNum),res)) +
+          geom_point(aes(col="residuals"),alpha= 0.8) +
+          geom_hline(yintercept = 0, linetype="dashed")+
+          ylab("Residuals")+
+          xlab("")+
+          theme(legend.title = element_blank()))
+  readline(prompt="Press [enter] to continue")
+}
+
+fitted_dataset %>%
+  filter(state == i) %>%
+  group_by(year)%>%
+  summarise(avg = mean(number))%>%
+  ggplot(aes(year,avg)) +
+  geom_line()
+
+
+
+# Aggregated model for Brazil
+
+
+Brazil_CARModel = fitted_dataset %>%
+  ungroup() %>%
+  group_by(Date)%>%
+  summarise(number= sum(number),fitted=sum(fitted))
+
+save(Brazil_CARModel, file = "Brazil_Aggregated.RData")
+
+#R2 and MSE
+rsq(Brazil_CARModel$number,Brazil_CARModel$fitted)
+mean((Brazil_CARModel$number-Brazil_CARModel$fitted)^2)
+
+
+print(ggplot(Brazil_CARModel, aes(as.Date(Date),fitted)) +
+        geom_point(aes(col="fitted"),alpha= 0.8) +
+        geom_point(aes(as.Date(Date),number,col="true"),alpha=0.8)+
+        ylab("Number of Forest Fires")+
+        xlab("")+
+        scale_x_date(date_breaks = "2 year",date_labels="%Y")+
+        theme(legend.title = element_blank()))
+
+
+
+```
+
+
+# modelling whole dataset
+
+## modelling with state dummies
+
+```{r}
+# create dummy data for states
+amazon$state=as.factor(amazon$state)
+amazon_states <- as.data.frame(one_hot(as.data.table(amazon)))
+
+```
+
+
+```{r}
+relevantVars_stateDummy=c(relevantVars,colnames(amazon_states)[grepl( "state_" , names(amazon_states ) )])
+#remove one state to avoid dummy trap
+relevantVars_stateDummy[which(relevantVars_stateDummy!="state_Acre")]
+
+data_state=amazon_states
+# add intercept to the response matrix
+data_state$intercept=rep(1,nrow(data_state))
+
+# Define the variables for jags:
+Y = data_state$number
+X = data_state[,relevantVars_stateDummy]
+n = length(Y)
+p = ncol(X)
+
+# Define the data list:
+dataList = list(Y=Y,X=X,n=n,p=p)
+
+# Write the model specification:
+model_state_dummy_str = textConnection("model{
+   
+   # Likelihood
+   for(i in 1:n){
+      Y[i] ~ dpois(lambda[i])
+      log(lambda[i]) <- mu[i]+0.000000001
+      mu[i] <- inprod(beta[],X[i,])
+   }
+    
+    
+    # Priors
+    for(j in 1:p){
+      beta[j] ~ dnorm(0,inv.var[j])
+    }
+    
+    for(j in 1:p){
+      inv.var[j] ~ dunif(0.1,20)
+      sigma[j] = 1/inv.var[j]
+    }
+    
+    #inv.var ~ dgamma(1, 1)
+    #sigma = 1/inv.var
+    
+ }")
+
+# Set the options:
+burn = 1000
+n.iter = 5000
+n.adapt = 1000
+thin = 5 # you delete ten iterations for everyone you keep
+#to improve autocorrelation you can increase thinning
+## add more chains later
+n.chains = 1
+
+# Create a `jags` object
+model_state_dummy = jags.model(model_state_dummy_str,data=dataList,n.chains=n.chains,n.adapt=n.adapt)
+```
+
+
+```{r}
+
+
+# Save the output according to the arguments:
+samples_model_state_dummy =coda.samples(model_state_dummy,variable.names=c("beta","inv.var","sigma"),thin=thin,n.iter=n.iter)
+summary(samples_model_state_dummy)
+
+# plot results
+par(mfrow=c(2,2))
+plot(samples_model_state_dummy[,c('beta[2]','beta[1]')])
+plot(samples_model_state_dummy[,c('beta[3]','beta[4]')])
+plot(samples_model_state_dummy[,c('beta[5]','beta[6]')])
+
+plot(samples_model_state_dummy[,c('sigma[1]','sigma[4]')])
+plot(samples_model_state_dummy[,c('inv.var[1]','inv.var[2]')])
+plot(samples_model_state_dummy[,c('inv.var[3]','inv.var[4]')])
+```
+
+```{r}
+
+mod = as.matrix(do.call(rbind, samples_model_state_dummy))
+betas=mod[,grepl("beta",colnames(mod))]
+# get fitted values
+pmean_coef = apply(betas, 2, mean)
+fitted_mean =exp(as.matrix(X) %*% as.vector(pmean_coef))
+
+pmed_coef = apply(betas, 2, median)
+fitted_median =exp(as.matrix(X) %*% as.vector(pmed_coef))
+
+
+plot(data_state$number,col="blue")
+#points(fitted_mean,col="red",type="o")
+points(fitted_median,col="green")
+
+
+
+mse_median_state=mean((fitted_median-data_state$number)^2)
+mse_mean_state=mean((fitted_mean-data_state$number)^2)
+
+```
+
+### aggregated fitted values to compare with next model
+```{r}
+data_state=cbind(data_state,fitted_mean,fitted_median)
+data_state_agg <- data_state%>%group_by(season_1,season_2,season_3,season_4,year)%>%
+  summarise(number=sum(number),fitted_mean=sum(fitted_mean),fitted_median=sum(fitted_median))
+
+mse_median_state_agg=mean((data_state_agg$fitted_median-data_state$number)^2)
+mse_mean_state_agg=mean((data_state_agg$fitted_mean-data_state$number)^2)
+
+
+```
+
+# modelling aggregated values - whole of Brazil
+```{r}
+
+
+data_agg=amazon%>%group_by(MonthNum,year)%>%summarise(number=sum(number),ANOM=sum(ANOM),ClimAdjust=sum(ClimAdjust),season_1=max(season_1),season_2=max(season_2),season_3=max(season_3),season_4=max(season_4))
+
+data_agg$sc_ANOM=scale(data_agg$ANOM)
+data_agg$sc_yr_trend=scale(data_agg$year)
+data_agg$sc_ClimAdjust=scale(data_agg$ClimAdjust)
+
+# add intercept to the response matrix
+data_agg$intercept=rep(1,nrow(data_agg))
+
+# Define the variables for jags:
+Y = data_agg$number
+X = data_agg[,relevantVars]
+n = length(Y)
+p = ncol(X)
+
+# Define the data list:
+dataList = list(Y=Y,X=X,n=n,p=p)
+
+# Write the model specification:
+model_agg_str = textConnection("model{
+   
+   # Likelihood
+   for(i in 1:n){
+      Y[i] ~ dpois(lambda[i])
+      log(lambda[i]) <- mu[i]
+      mu[i] <- inprod(beta[],X[i,])
+    }
+    
+    # Priors
+    for(j in 1:p){
+      beta[j] ~ dnorm(0,inv.var[j])
+    }
+    
+    for(j in 1:p){
+      inv.var[j] ~ dunif(0.1,20)
+      sigma[j] = 1/inv.var[j]
+    }
+    
+    #inv.var ~ dgamma(1, 1)
+    #sigma = 1/inv.var
+    
+ }")
+
+# Set the options:
+burn = 2000
+n.iter = 10000
+n.adapt = 1000
+thin = 10 # you delete ten iterations for everyone you keep
+#to improve autocorrelation you can increase thinning
+## add more chains later
+n.chains = 1
+
+# Create a `jags` object:
+model_agg = jags.model(model_agg_str,data=dataList,n.chains=n.chains,n.adapt=n.adapt)
+
+
+# Save the output according to the arguments:
+samples_model_agg_str =coda.samples(model_agg,variable.names=c("beta","inv.var","sigma"),thin=thin,n.iter=n.iter)
+summary(samples_model_agg_str)
+
+# plot results
+par(mfrow=c(2,2))
+plot(samples_model_agg_str[,c('beta[2]','beta[1]')])
+plot(samples_model_agg_str[,c('beta[3]','beta[4]')])
+plot(samples_model_agg_str[,c('beta[5]','beta[6]')])
+
+plot(samples_model_agg_str[,c('sigma[1]','sigma[2]')])
+plot(samples_model_agg_str[,c('sigma[3]','sigma[4]')])
+plot(samples_model_agg_str[,c('sigma[5]','sigma[6]')])
+plot(samples_model_agg_str[,c('inv.var[1]','inv.var[2]')])
+plot(samples_model_agg_str[,c('inv.var[3]','inv.var[4]')])
+```
+
+
+```{r}
+
+mod = as.matrix(do.call(rbind, samples_model_agg_str))
+betas=mod[,grepl("beta",colnames(mod))]
+# get fitted values
+pmean_coef = apply(betas, 2, mean)
+fitted_mean =exp(as.matrix(X) %*% as.vector(pmean_coef))
+
+plot(data_agg$number,col="blue")
+points(fitted_mean,col="red",type="o")
+
+mse_mean=mean((fitted_mean-data_agg$number)^2)
+
+
+library(lubridate)
+date=data_agg %>% 
+  select(year, MonthNum) %>% 
+  mutate(date = make_date(year, MonthNum))
+
+
+ggplot()+
+  geom_point(aes(y=data_agg$number,x=date$date,col="true"))+
+  #geom_line(aes(y=data_agg$number,x=date$date,col="true"))+
+  #geom_line(aes(y=fitted_mean,x=date$date,col="fitted"),alpha = 0.8)+
+  geom_point(aes(y=fitted_mean,x=date$date,col="fitted"),alpha = 0.8)+
+  ylab("Number of Forest Fires")+
+  xlab("")+
+  scale_x_date(date_breaks = "2 year",date_labels="%Y")+
+  theme(legend.title = element_blank())
+```
+
+
+
